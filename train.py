@@ -8,6 +8,7 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 import os
+from accelerate import Accelerator
 
 class CODI_Dataset(Dataset) :
 
@@ -26,7 +27,7 @@ class CODI_Dataset(Dataset) :
                     file_path = os.path.join(root, file)
                     df = pd.read_parquet(file_path)
                     self.data.extend(df.to_dict(orient='records'))
-    
+
     def __len__(self) :
 
         return len(self.data)
@@ -38,12 +39,12 @@ class CODI_Dataset(Dataset) :
             # Get the question and answer
             question = self.data[idx]['quiz']
             answer = self.data[idx]['solution_text']
-            
+
             # Construct the chain of thought
             cot_head = self.data[idx]['cot_head']
             cot_steps = self.data[idx]['cot_repeat_steps']
             cot_foot = self.data[idx]['cot_foot']
-            
+
             # Combine all CoT components
             cot = f"{cot_head}\n" + "\n".join(cot_steps) + f"\n{cot_foot}"
 
@@ -74,7 +75,7 @@ class CODI_Dataset(Dataset) :
             student_loss_mask = student_attention_mask.clone()
             teacher_loss_mask[:, :len(bos_input_ids[0]) + len(question_input_ids[0])] = 0
             student_loss_mask[:, :len(bos_input_ids[0]) + len(question_input_ids[0]) + len(icot_input_ids[0])] = 0
-            
+
             teacher_symbol_position = len(bos_input_ids[0]) + len(question_input_ids[0]) + len(cot_input_ids[0]) + len(symbol_input_ids[0]) - 1
             student_symbol_position = len(bos_input_ids[0]) + len(question_input_ids[0]) + len(icot_input_ids[0]) + len(symbol_input_ids[0]) - 1
 
@@ -96,12 +97,12 @@ class CODI_Dataset(Dataset) :
 
             question = self.data[idx]['quiz']
             answer = self.data[idx]['solution_text']
-            
+
             bos_input_ids = self.tokenizer('<|endoftext|>', return_tensors = 'pt', add_special_tokens = False)['input_ids']
             question_input_ids = self.tokenizer(question, return_tensors = 'pt', add_special_tokens = False)['input_ids']
             icot_input_ids = self.tokenizer('<bot>' + '<|endoftext|>' * self.icot_length + '<eot>', return_tensors = 'pt', add_special_tokens = False)['input_ids']
             symbol_input_ids = self.tokenizer('The Answer is:', return_tensors = 'pt', add_special_tokens = False)['input_ids']
-            
+
             input_ids = torch.cat([bos_input_ids, question_input_ids, icot_input_ids, symbol_input_ids], dim = 1)
 
             pad_input_ids = torch.cat([bos_input_ids for i in range(self.max_length - len(input_ids[0]))], dim = 1)
@@ -125,26 +126,26 @@ class CODI_Dataset(Dataset) :
 class CODI_Model(nn.Module) :
 
     def __init__(self, model_path, icot_length = 6, alpha = 1, beta = 1, gamma = 1, max_length = 256) :
-        
+
         super(CODI_Model, self).__init__()
 
         self.max_length = max_length
         self.icot_length = icot_length
-        
+
         # Initialize Qwen2.5 tokenizer and model
         self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct-1M")
         self.tokenizer.add_special_tokens({'additional_special_tokens': ['<bot>', '<eot>']})
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+
         # Load the model with bfloat16 precision and move to CUDA
         self.model = AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-7B-Instruct-1M",
             torch_dtype=torch.bfloat16
         ).to('cuda')
-        
+
         # Resize token embeddings to accommodate new special tokens
         self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=True)
-        
+
         # Configure LoRA for Qwen2.5
         config = LoraConfig(
             r=128,
@@ -156,20 +157,20 @@ class CODI_Model(nn.Module) :
             fan_in_fan_out=True
         )
         self.model = get_peft_model(self.model, config)
-        
+
         self.proj = nn.Sequential(
             nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size, dtype=torch.bfloat16),
             nn.GELU(),
             nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size, dtype=torch.bfloat16),
             nn.LayerNorm(self.model.config.hidden_size, dtype=torch.bfloat16)
         )
-        
+
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.ce_loss = nn.CrossEntropyLoss(reduction='none')
         self.l1_loss = nn.SmoothL1Loss()
-    
+
     def forward(self, inputs) :
 
         teacher_input_ids = inputs['teacher_input_ids'].to('cuda')
@@ -210,7 +211,7 @@ class CODI_Model(nn.Module) :
 
         teacher_symbol_positions = inputs['teacher_symbol_position']
         student_symbol_positions = inputs['student_symbol_position']
-        
+
         distill_loss = 0
         for i in range(len(teacher_hidden_states) - 1) :
             teacher_distill_hidden_states = []
@@ -231,7 +232,7 @@ class CODI_Model(nn.Module) :
             'distill_loss' : distill_loss,
             'loss' : loss
         }
-    
+
     def test(self, inputs) :
 
         true_answers = inputs['answer']
@@ -291,13 +292,14 @@ def CODI_train(
     patience = 3,  # Number of test steps to wait before early stopping
     min_delta = 0.001  # Minimum change in loss to be considered an improvement
 ) :
-    
+
+    accelerator = Accelerator()
     model = CODI_Model(model_path)
 
     # Load data from the new directory structure
     train_data = CODI_Dataset(data_dir, model.tokenizer, split='train')
     test_data = CODI_Dataset(data_dir, model.tokenizer, split='test')
-    
+
     # Use DataLoader with multiple workers
     train_data_loader = DataLoader(
         train_data,
@@ -324,12 +326,17 @@ def CODI_train(
                             # - Second beta (0.999): Controls the exponential decay rate for the second moment estimates
         eps=1e-8           # Epsilon: Small constant for numerical stability
     )
-    
+
     total_steps = len(train_data_loader) * epochs
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps = int(warmup_rate * total_steps),
         num_training_steps = total_steps
+    )
+
+    # Prepare everything for distributed training
+    model, optimizer, train_data_loader, test_data_loader = accelerator.prepare(
+        model, optimizer, train_data_loader, test_data_loader
     )
 
     model.train()
@@ -339,64 +346,65 @@ def CODI_train(
     best_test_loss = float('inf')
     patience_counter = 0
     best_model_state = None
-    
+
     ckpt_path=os.path.expandvars("$SCRATCH/results/ckpt/final.pth")
-    
+
     for epoch in range(epochs) :
         for batch in train_data_loader :
-            loss = model(batch)['loss'] / gradient_accumulation_steps
-            loss.backward()
-            loss_list.append(loss.item())
-            accumulated_steps += 1
-            
-            if accumulated_steps % gradient_accumulation_steps == 0 :
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                
-                print(f'epoch: {epoch}, step: {accumulated_steps / gradient_accumulation_steps}, loss: {sum(loss_list)}')
-                loss_list = []
-                
-            if (accumulated_steps / gradient_accumulation_steps) % test_steps == 0 :
-                # Evaluate on test set
-                model.eval()
-                test_loss = 0
-                test_batches = 0
-                with torch.no_grad():
-                    for test_batch in test_data_loader:
-                        test_result = model(test_batch)
-                        test_loss += test_result['loss'].item()
-                        test_batches += 1
-                test_loss /= test_batches
-                model.train()
-                
-                print(f'Test loss: {test_loss:.4f}')
-                
-                # Early stopping check
-                if test_loss < best_test_loss - min_delta:
-                    best_test_loss = test_loss
-                    patience_counter = 0
-                    best_model_state = model.state_dict()
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f'Early stopping triggered after {accumulated_steps / gradient_accumulation_steps} steps')
-                        # Load best model state
-                        model.load_state_dict(best_model_state)
-                        # Save final model
-                        torch.save(model.state_dict(), ckpt_path)
-                        return
-                
-                # Save test results
-                test_result = CODI_test(model, test_data_loader)
-                with open(f'{os.environ.get("SCRATCH")}/result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
-                    json.dump(test_result, f)
-                    
-            if (accumulated_steps / gradient_accumulation_steps) % save_steps == 0 : 
-                torch.save(model.state_dict(), f'{os.environ.get("SCRATCH")}/result/ckpt/{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}.pth')
-                
+            with accelerator.accumulate(model):
+                loss = model(batch)['loss'] / gradient_accumulation_steps
+                accelerator.backward(loss)
+                loss_list.append(loss.item())
+                accumulated_steps += 1
+
+                if accumulated_steps % gradient_accumulation_steps == 0 :
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                    print(f'epoch: {epoch}, step: {accumulated_steps / gradient_accumulation_steps}, loss: {sum(loss_list)}')
+                    loss_list = []
+
+                if (accumulated_steps / gradient_accumulation_steps) % test_steps == 0 :
+                    # Evaluate on test set
+                    model.eval()
+                    test_loss = 0
+                    test_batches = 0
+                    with torch.no_grad():
+                        for test_batch in test_data_loader:
+                            test_result = model(test_batch)
+                            test_loss += test_result['loss'].item()
+                            test_batches += 1
+                    test_loss /= test_batches
+                    model.train()
+
+                    print(f'Test loss: {test_loss:.4f}')
+
+                    # Early stopping check
+                    if test_loss < best_test_loss - min_delta:
+                        best_test_loss = test_loss
+                        patience_counter = 0
+                        best_model_state = model.state_dict()
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= patience:
+                            print(f'Early stopping triggered after {accumulated_steps / gradient_accumulation_steps} steps')
+                            # Load best model state
+                            model.load_state_dict(best_model_state)
+                            # Save final model
+                            torch.save(model.state_dict(), ckpt_path)
+                            return
+
+                    # Save test results
+                    test_result = CODI_test(model, test_data_loader)
+                    with open(f'{os.environ.get("SCRATCH")}/result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
+                        json.dump(test_result, f)
+
+                if (accumulated_steps / gradient_accumulation_steps) % save_steps == 0 : 
+                    torch.save(model.state_dict(), f'{os.environ.get("SCRATCH")}/result/ckpt/{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}.pth')
+
     torch.save(model.state_dict(), ckpt_path)
 
 def CODI_test(model, test_data_loader) :
@@ -414,7 +422,7 @@ def CODI_test(model, test_data_loader) :
     }
 
 if __name__ == '__main__' :
-    
+
     # 训练
     CODI_train()
 
