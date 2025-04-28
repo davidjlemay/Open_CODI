@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --account=def-gdumas85
+#SBATCH --account={CC_ACCOUNT}
 #SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --mail-user=davidjlemay@gmail.com
+#SBATCH --mail-user={EMAIL}
 #SBATCH --mail-type=END
 #SBATCH --output=%N.%j.out
 
