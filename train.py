@@ -19,8 +19,7 @@ class CODI_Dataset(Dataset) :
         self.max_length = max_length
 
         if self.split == 'train' :
-            with open(self.data_path, 'r', encoding = 'utf-8') as f :
-                self.data = f.readlines()
+            self.data = pd.read_parquet(self.data_path).to_dict(orient = 'records')
         if self.split == 'test' :
             self.data = pd.read_parquet(self.data_path).to_dict(orient = 'records')
     
@@ -32,9 +31,17 @@ class CODI_Dataset(Dataset) :
 
         if self.split == 'train' :
 
-            question, answer = self.data[idx].strip().split('||')
-            cot, answer = answer.split(' #### ')
-            cot = ' '.join(cot.split(' ')[:-1])
+            # Get the question and answer
+            question = self.data[idx]['quiz']
+            answer = self.data[idx]['solution_text']
+            
+            # Construct the chain of thought
+            cot_head = self.data[idx]['cot_head']
+            cot_steps = self.data[idx]['cot_repeat_steps']
+            cot_foot = self.data[idx]['cot_foot']
+            
+            # Combine all CoT components
+            cot = f"{cot_head}\n" + "\n".join(cot_steps) + f"\n{cot_foot}"
 
             bos_input_ids = self.tokenizer('<|endoftext|>', return_tensors = 'pt', add_special_tokens = False)['input_ids']
             question_input_ids = self.tokenizer(question, return_tensors = 'pt', add_special_tokens = False)['input_ids']
@@ -83,8 +90,8 @@ class CODI_Dataset(Dataset) :
 
         if self.split == 'test' :
 
-            question = self.data[idx]['question']
-            cot, answer =  self.data[idx]['answer'].split('\n#### ')
+            question = self.data[idx]['quiz']
+            answer = self.data[idx]['solution_text']
             
             bos_input_ids = self.tokenizer('<|endoftext|>', return_tensors = 'pt', add_special_tokens = False)['input_ids']
             question_input_ids = self.tokenizer(question, return_tensors = 'pt', add_special_tokens = False)['input_ids']
