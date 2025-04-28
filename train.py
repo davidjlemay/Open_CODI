@@ -7,21 +7,25 @@ from tqdm import tqdm
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
+import os
 
 class CODI_Dataset(Dataset) :
 
-    def __init__(self, data_path, tokenizer, split = 'train', icot_length = 6, max_length = 256) :
+    def __init__(self, data_dir, tokenizer, split = 'train', icot_length = 6, max_length = 256) :
 
-        self.data_path = data_path
+        self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.split = split
         self.icot_length = icot_length
         self.max_length = max_length
 
-        if self.split == 'train' :
-            self.data = pd.read_parquet(self.data_path).to_dict(orient = 'records')
-        if self.split == 'test' :
-            self.data = pd.read_parquet(self.data_path).to_dict(orient = 'records')
+        self.data = []
+        for root, _, files in os.walk(os.path.join(data_dir, split)):
+            for file in files:
+                if file.endswith('.parquet'):
+                    file_path = os.path.join(root, file)
+                    df = pd.read_parquet(file_path)
+                    self.data.extend(df.to_dict(orient='records'))
     
     def __len__(self) :
 
@@ -126,32 +130,44 @@ class CODI_Model(nn.Module) :
 
         self.max_length = max_length
         self.icot_length = icot_length
-        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
+        
+        # Initialize Qwen2.5 tokenizer and model
+        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct-1M")
         self.tokenizer.add_special_tokens({'additional_special_tokens': ['<bot>', '<eot>']})
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained('gpt2', torch_dtype = torch.bfloat16)
-        self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing = True)
-        config = LoraConfig(
-            r = 128,
-            lora_alpha = 32,
-            target_modules = ['c_attn'],
-            lora_dropout = 0.1,
-            bias = 'none',
-            task_type = 'CAUSAL_LM',
-            fan_in_fan_out = True
-        )
-        self.model = get_peft_model(self.model, config).to('cuda')
-        self.proj = nn.Sequential(
-            nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size, dtype = torch.bfloat16),
-            nn.GELU(),
-            nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size, dtype = torch.bfloat16),
-            nn.LayerNorm(self.model.config.hidden_size, dtype = torch.bfloat16)
+        
+        # Load the model with bfloat16 precision and move to CUDA
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-7B-Instruct-1M",
+            torch_dtype=torch.bfloat16
         ).to('cuda')
+        
+        # Resize token embeddings to accommodate new special tokens
+        self.model.resize_token_embeddings(len(self.tokenizer), mean_resizing=True)
+        
+        # Configure LoRA for Qwen2.5
+        config = LoraConfig(
+            r=128,
+            lora_alpha=32,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Updated for Qwen2.5 architecture
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM",
+            fan_in_fan_out=True
+        )
+        self.model = get_peft_model(self.model, config)
+        
+        self.proj = nn.Sequential(
+            nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size, dtype=torch.bfloat16),
+            nn.GELU(),
+            nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size, dtype=torch.bfloat16),
+            nn.LayerNorm(self.model.config.hidden_size, dtype=torch.bfloat16)
+        )
         
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
-        self.ce_loss = nn.CrossEntropyLoss(reduction = 'none')
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
         self.l1_loss = nn.SmoothL1Loss()
     
     def forward(self, inputs) :
@@ -260,41 +276,125 @@ class CODI_Model(nn.Module) :
             'answers' : answers
         }
 
-def CODI_train(model = 'gpt2', train_data_path = '../data/train.txt', test_data_path = '../data/test.parquet', epochs = 40, batch_size = 64, gradient_accumulation_steps = 2, lr = 3e-3, weight_decay = 1, warmup_rate = 0.03, test_steps = 3005, save_steps = 3005) :
+def CODI_train(
+    model_path = "Qwen/Qwen2.5-7B-Instruct-1M",
+    data_dir = 'data/instruct',
+    epochs = 40,
+    batch_size = 16,  # Increased for A100
+    gradient_accumulation_steps = 4,  # Adjusted for larger batch size
+    lr = 2e-4,  # Slightly increased learning rate
+    weight_decay = 0.01,
+    warmup_rate = 0.1,
+    test_steps = 100,
+    save_steps = 100,
+    num_workers = 4, # For data loading
+    patience = 3,  # Number of test steps to wait before early stopping
+    min_delta = 0.001  # Minimum change in loss to be considered an improvement
+) :
     
-    model = CODI_Model(model)
+    model = CODI_Model(model_path)
 
-    train_data = CODI_Dataset(train_data_path, model.tokenizer)
-    test_data = CODI_Dataset(test_data_path, model.tokenizer, split = 'test')
-    train_data_loader = DataLoader(train_data, batch_size = batch_size, shuffle = True)
-    test_data_loader = DataLoader(test_data, batch_size = batch_size, shuffle = False)
+    # Load data from the new directory structure
+    train_data = CODI_Dataset(data_dir, model.tokenizer, split='train')
+    test_data = CODI_Dataset(data_dir, model.tokenizer, split='test')
+    
+    # Use DataLoader with multiple workers
+    train_data_loader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True  # Faster data transfer to GPU
+    )
+    test_data_loader = DataLoader(
+        test_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
 
-    optimizer = optim.AdamW(model.parameters(), lr = lr, weight_decay = weight_decay)
+    # Use AdamW optimizer with weight decay
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=lr,           # Learning rate: Increased from 1e-4 to 2e-4 for faster convergence
+        weight_decay=weight_decay, # L2 regularization: Helps prevent overfitting
+        betas=(0.9, 0.999), # Momentum parameters:
+                            # - First beta (0.9): Controls the exponential decay rate for the first moment estimates
+                            # - Second beta (0.999): Controls the exponential decay rate for the second moment estimates
+        eps=1e-8           # Epsilon: Small constant for numerical stability
+    )
+    
     total_steps = len(train_data_loader) * epochs
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps = int(warmup_rate * total_steps), num_training_steps = total_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps = int(warmup_rate * total_steps),
+        num_training_steps = total_steps
+    )
 
     model.train()
 
     accumulated_steps = 0
     loss_list = []
+    best_test_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
     for epoch in range(epochs) :
         for batch in train_data_loader :
             loss = model(batch)['loss'] / gradient_accumulation_steps
             loss.backward()
             loss_list.append(loss.item())
             accumulated_steps += 1
+            
             if accumulated_steps % gradient_accumulation_steps == 0 :
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-                print(f'epoch : {epoch}, step : {accumulated_steps / gradient_accumulation_steps}, loss : {sum(loss_list)}')
+                
+                print(f'epoch: {epoch}, step: {accumulated_steps / gradient_accumulation_steps}, loss: {sum(loss_list)}')
                 loss_list = []
+                
             if (accumulated_steps / gradient_accumulation_steps) % test_steps == 0 :
+                # Evaluate on test set
+                model.eval()
+                test_loss = 0
+                test_batches = 0
+                with torch.no_grad():
+                    for test_batch in test_data_loader:
+                        test_result = model(test_batch)
+                        test_loss += test_result['loss'].item()
+                        test_batches += 1
+                test_loss /= test_batches
+                model.train()
+                
+                print(f'Test loss: {test_loss:.4f}')
+                
+                # Early stopping check
+                if test_loss < best_test_loss - min_delta:
+                    best_test_loss = test_loss
+                    patience_counter = 0
+                    best_model_state = model.state_dict()
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print(f'Early stopping triggered after {accumulated_steps / gradient_accumulation_steps} steps')
+                        # Load best model state
+                        model.load_state_dict(best_model_state)
+                        # Save final model
+                        torch.save(model.state_dict(), '../result/ckpt/final.pth')
+                        return
+                
+                # Save test results
                 test_result = CODI_test(model, test_data_loader)
                 with open(f'../result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
                     json.dump(test_result, f)
+                    
             if (accumulated_steps / gradient_accumulation_steps) % save_steps == 0 : 
                 torch.save(model.state_dict(), f'../result/ckpt/{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}.pth')
+                
     torch.save(model.state_dict(), '../result/ckpt/final.pth')
 
 def CODI_test(model, test_data_loader) :
