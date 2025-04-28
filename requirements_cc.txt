@@ -1,0 +1,5 @@
+torch==2.6.0+computecanada
+pandas==2.2.1+computecanada
+tqdm==4.67.1+computecanada
+peft==0.15.0+computecanada
+transformers==4.49.0+computecanada

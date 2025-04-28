@@ -278,7 +278,7 @@ class CODI_Model(nn.Module) :
 
 def CODI_train(
     model_path = "Qwen/Qwen2.5-7B-Instruct-1M",
-    data_dir = 'data/instruct',
+    data_dir = os.path.expandvars("$SCRATCH/data/instruct"),
     epochs = 40,
     batch_size = 16,  # Increased for A100
     gradient_accumulation_steps = 4,  # Adjusted for larger batch size
@@ -340,6 +340,8 @@ def CODI_train(
     patience_counter = 0
     best_model_state = None
     
+    ckpt_path=os.path.expandvars("$SCRATCH/results/ckpt/final.pth")
+    
     for epoch in range(epochs) :
         for batch in train_data_loader :
             loss = model(batch)['loss'] / gradient_accumulation_steps
@@ -384,18 +386,18 @@ def CODI_train(
                         # Load best model state
                         model.load_state_dict(best_model_state)
                         # Save final model
-                        torch.save(model.state_dict(), '../result/ckpt/final.pth')
+                        torch.save(model.state_dict(), ckpt_path)
                         return
                 
                 # Save test results
                 test_result = CODI_test(model, test_data_loader)
-                with open(f'../result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
+                with open(f'{os.environ.get("SCRATCH")}/result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
                     json.dump(test_result, f)
                     
             if (accumulated_steps / gradient_accumulation_steps) % save_steps == 0 : 
-                torch.save(model.state_dict(), f'../result/ckpt/{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}.pth')
+                torch.save(model.state_dict(), f'{os.environ.get("SCRATCH")}/result/ckpt/{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}.pth')
                 
-    torch.save(model.state_dict(), '../result/ckpt/final.pth')
+    torch.save(model.state_dict(), ckpt_path)
 
 def CODI_test(model, test_data_loader) :
 
