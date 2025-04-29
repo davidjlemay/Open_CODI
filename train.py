@@ -279,7 +279,7 @@ class CODI_Model(nn.Module) :
 
 def CODI_train(
     model_path = "Qwen/Qwen2.5-7B-Instruct-1M",
-    data_dir = os.path.expandvars("$SCRATCH/data/instruct"),
+    data_dir = os.path.expandvars("$SLURM_TMPDIR/data/instruct"),
     epochs = 40,
     batch_size = 16,  # Increased for A100
     gradient_accumulation_steps = 4,  # Adjusted for larger batch size
@@ -335,9 +335,14 @@ def CODI_train(
     )
 
     # Prepare everything for distributed training
-    model, optimizer, train_data_loader, test_data_loader = accelerator.prepare(
-        model, optimizer, train_data_loader, test_data_loader
+    model, optimizer, train_data_loader, test_data_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_data_loader, test_data_loader, scheduler
     )
+
+    # Create checkpoint directory
+    ckpt_dir = os.path.expandvars("$SLURM_TMPDIR/results/ckpt")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    final_ckpt_path = os.path.join(ckpt_dir, "final")
 
     model.train()
 
@@ -347,7 +352,6 @@ def CODI_train(
     patience_counter = 0
     best_model_state = None
 
-    ckpt_path=os.path.expandvars("$SCRATCH/results/ckpt/final.pth")
 
     for epoch in range(epochs) :
         for batch in train_data_loader :
@@ -386,26 +390,38 @@ def CODI_train(
                     if test_loss < best_test_loss - min_delta:
                         best_test_loss = test_loss
                         patience_counter = 0
-                        best_model_state = model.state_dict()
+                        # Save and immediately use the best model state
+                        accelerator.wait_for_everyone()
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        best_model_state = accelerator.get_state_dict(unwrapped_model)
+                        # Immediately load the best state back to continue training from the best point
+                        accelerator.load_state_dict(unwrapped_model, best_model_state)
+                        print(f'New best test loss: {test_loss:.4f}, saving model state')
                     else:
                         patience_counter += 1
                         if patience_counter >= patience:
                             print(f'Early stopping triggered after {accumulated_steps / gradient_accumulation_steps} steps')
                             # Load best model state
-                            model.load_state_dict(best_model_state)
+                            unwrapped_model = accelerator.unwrap_model(model)
+                            accelerator.load_state_dict(unwrapped_model, best_model_state)
                             # Save final model
-                            torch.save(model.state_dict(), ckpt_path)
+                            accelerator.wait_for_everyone()
+                            accelerator.save_state(final_ckpt_path)
                             return
 
                     # Save test results
                     test_result = CODI_test(model, test_data_loader)
-                    with open(f'{os.environ.get("SCRATCH")}/result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
+                    with open(f'{os.environ.get("SLURM_TMPDIR")}/result/test/{int((accumulated_steps / gradient_accumulation_steps) / test_steps)}.json', 'a') as f :
                         json.dump(test_result, f)
 
-                if (accumulated_steps / gradient_accumulation_steps) % save_steps == 0 : 
-                    torch.save(model.state_dict(), f'{os.environ.get("SCRATCH")}/result/ckpt/{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}.pth')
+                if (accumulated_steps / gradient_accumulation_steps) % save_steps == 0:
+                    accelerator.wait_for_everyone()
+                    checkpoint_path = os.path.join(ckpt_dir, f"checkpoint_{int((accumulated_steps / gradient_accumulation_steps) / save_steps)}")
+                    accelerator.save_state(checkpoint_path)
 
-    torch.save(model.state_dict(), ckpt_path)
+    # Save final model
+    accelerator.wait_for_everyone()
+    accelerator.save_state(final_ckpt_path)
 
 def CODI_test(model, test_data_loader) :
 
